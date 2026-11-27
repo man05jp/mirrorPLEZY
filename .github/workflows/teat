@@ -1,0 +1,169 @@
+name: Mirror Plezy Nightly Apk
+
+on:
+  schedule:
+    - cron: "0 0,7,9,11,13,15,17,19,21,23 * * *"
+  workflow_dispatch:
+
+env:
+  REPO_NAME: edde746/plezy
+  WORKFLOW_NAME: Build
+  ARTIFACT_NAME: android-apk
+  ARM_64_APK: "*arm64-v8a.tar.gz"
+  STAGING: staging
+  TEMP_ART: temp_art
+  NIGHTLY_APK_NAME: nightly.apk
+
+concurrency:
+  group: plezy-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check Upstream Latest Build or Prerelease
+        id: release_info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPDATE_TIME=$(TZ='Etc/GMT-3' date +"%Y-%m-%d %H:%M UTC%:z")
+          echo "UPDATE_TIME=$UPDATE_TIME" >> "$GITHUB_ENV"
+
+          # 1. Check latest successful Build workflow run
+          LATEST_RUN_JSON=$(gh run list --repo "$REPO_NAME" --workflow "$WORKFLOW_NAME" --status success --limit 1 --json databaseId,headSha,updatedAt 2>/dev/null || echo "[]")
+          LATEST_BUILD_ID=$(echo "$LATEST_RUN_JSON" | jq -r '.[0].databaseId // empty')
+          BUILD_COMMIT_SHA=$(echo "$LATEST_RUN_JSON" | jq -r '.[0].headSha // empty')
+          BUILD_UPDATED_AT=$(echo "$LATEST_RUN_JSON" | jq -r '.[0].updatedAt // empty')
+
+          BUILD_EPOCH=0
+          if [ -n "$LATEST_BUILD_ID" ] && [ -n "$BUILD_UPDATED_AT" ]; then
+            RUN_JSON=$(gh run view "$LATEST_BUILD_ID" --repo "$REPO_NAME" --json jobs)
+            BUILD_STATUS=$(echo "$RUN_JSON" | jq -r '.jobs[] | select(.name=="build-android") | .conclusion')
+            RELEASE_STATUS=$(echo "$RUN_JSON" | jq -r '.jobs[] | select(.name=="create-release") | .conclusion')
+
+            echo "Build: $BUILD_STATUS"
+            echo "Release: $RELEASE_STATUS"
+
+            if [ "$BUILD_STATUS" = "success" ] && [ "$RELEASE_STATUS" = "success" ]; then
+              BUILD_EPOCH=$(date -d "$BUILD_UPDATED_AT" +%s)
+            fi
+          fi
+
+          # 2. Check latest upstream prerelease
+          PRERELEASE_LIST_JSON=$(gh release list --repo "$REPO_NAME" --limit 20 --json tagName,isPrerelease,isDraft,publishedAt,createdAt 2>/dev/null || echo "[]")
+          LATEST_PRE_TAG=$(echo "$PRERELEASE_LIST_JSON" | jq -r '[.[] | select(.isPrerelease==true and .isDraft==false)] | sort_by(.publishedAt // .createdAt) | last | .tagName // empty')
+          PRE_PUBLISHED_AT=$(echo "$PRERELEASE_LIST_JSON" | jq -r '[.[] | select(.isPrerelease==true and .isDraft==false)] | sort_by(.publishedAt // .createdAt) | last | (.publishedAt // .createdAt) // empty')
+
+          PRE_EPOCH=0
+          PRE_COMMIT_SHA=""
+          if [ -n "$LATEST_PRE_TAG" ] && [ -n "$PRE_PUBLISHED_AT" ]; then
+            PRE_EPOCH=$(date -d "$PRE_PUBLISHED_AT" +%s)
+            PRE_COMMIT_SHA=$(git ls-remote "https://github.com/$REPO_NAME.git" "refs/tags/$LATEST_PRE_TAG*" | head -n1 | cut -f1)
+          fi
+
+          if [ "$BUILD_EPOCH" -eq 0 ] && [ "$PRE_EPOCH" -eq 0 ]; then
+            echo "No successful upstream builds or prereleases found"
+            exit 0
+          fi
+
+          # 3. Pick whichever is newer (Build vs Prerelease)
+          if [ "$PRE_EPOCH" -gt "$BUILD_EPOCH" ]; then
+            SOURCE_TYPE="prerelease"
+            SOURCE_ID="$LATEST_PRE_TAG"
+            TARGET_TAG="prerelease-${LATEST_PRE_TAG}"
+            UPSTREAM_COMMIT_SHA="$PRE_COMMIT_SHA"
+            SOURCE_URL="https://github.com/${REPO_NAME}/releases/tag/${LATEST_PRE_TAG}"
+            echo "::Notice::Latest candidate is upstream prerelease: $LATEST_PRE_TAG"
+          else
+            SOURCE_TYPE="build"
+            SOURCE_ID="$LATEST_BUILD_ID"
+            TARGET_TAG="build-${LATEST_BUILD_ID}"
+            UPSTREAM_COMMIT_SHA="$BUILD_COMMIT_SHA"
+            SOURCE_URL="https://github.com/${REPO_NAME}/actions/runs/${LATEST_BUILD_ID}"
+            echo "::Notice::Latest candidate is upstream build: $LATEST_BUILD_ID"
+          fi
+
+          echo "SOURCE_TYPE=$SOURCE_TYPE" >> "$GITHUB_ENV"
+          echo "SOURCE_ID=$SOURCE_ID" >> "$GITHUB_ENV"
+          echo "TARGET_TAG=$TARGET_TAG" >> "$GITHUB_ENV"
+          echo "UPSTREAM_COMMIT_SHA=$UPSTREAM_COMMIT_SHA" >> "$GITHUB_ENV"
+          echo "SOURCE_URL=$SOURCE_URL" >> "$GITHUB_ENV"
+
+          # 4. Check if your repo already has this exact candidate
+          if gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+            build_exist=true
+            echo "::Notice::$TARGET_TAG already exists in mirror. Skipping."
+          else
+            build_exist=false
+            echo "::Notice::New candidate $TARGET_TAG detected. Overwriting current prerelease."
+          fi
+          echo "build_exist=$build_exist" >> "$GITHUB_OUTPUT"
+
+          # 5. Overwrite: delete existing prerelease(s) only when a newer one will be published
+          if [ "$build_exist" = "false" ]; then
+            mkdir -p "$STAGING" "$TEMP_ART"
+
+            EXISTING_PRERELEASE_TAGS=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isPrerelease --jq '.[] | select(.isPrerelease==true) | .tagName')
+            for old_tag in $EXISTING_PRERELEASE_TAGS; do
+              echo "Deleting old nightly/prerelease: $old_tag"
+              gh release delete "$old_tag" --repo "$GITHUB_REPOSITORY" --yes
+              git push --delete origin "$old_tag" || true
+            done
+          fi
+
+      - name: Download and Extract Build or Prerelease APK
+        if: steps.release_info.outputs.build_exist == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$SOURCE_TYPE" = "build" ]; then
+            echo "Downloading nightly build artifact..."
+            gh run download "$SOURCE_ID" --repo "$REPO_NAME" --name "$ARTIFACT_NAME" --dir "$TEMP_ART" || true
+          else
+            echo "Downloading upstream prerelease asset..."
+            gh release download "$SOURCE_ID" --repo "$REPO_NAME" --pattern "$ARM_64_APK" --dir "$TEMP_ART" || true
+          fi
+
+          echo "New build/prerelease found, triggering Release workflow..."
+          gh workflow run "Mirror Plezy Release Apk" --repo "$GITHUB_REPOSITORY"
+
+          echo "Extracting APK..."
+          for file in "$TEMP_ART"/*arm64-v8a.tar.gz; do
+            [ -f "$file" ] || continue
+            mkdir -p "$TEMP_ART/extracted"
+            tar -xzf "$file" -C "$TEMP_ART/extracted"
+            find "$TEMP_ART/extracted" -name "*.apk" \
+              -exec mv {} "$STAGING/$NIGHTLY_APK_NAME" \;
+          done
+
+      - name: Publish New Release
+        if: steps.release_info.outputs.build_exist == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TARGET_TAG }}
+          name: Plezy Mirror (${{ env.SOURCE_ID }})
+          body: |
+            ## Plezy Mirror of [${{ env.REPO_NAME }}](https://github.com/${{ env.REPO_NAME }})
+
+            **Link to Source:** [plezy/${{ env.SOURCE_TYPE }}/${{ env.SOURCE_ID }}](${{ env.SOURCE_URL }})
+
+            ### 📦 Version Details
+            - **Source Type:** `${{ env.SOURCE_TYPE }}` (`${{ env.SOURCE_ID }}`)
+            - **Commit:** https://github.com/${{ env.REPO_NAME }}/commit/${{ env.UPSTREAM_COMMIT_SHA }}
+            - **Updated at:** `${{ env.UPDATE_TIME }}`
+
+            ---
+            *Automated build.*
+          files: staging/*.apk
+          make_latest: false
+          prerelease: true
